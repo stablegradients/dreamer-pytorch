@@ -29,7 +29,7 @@ loss_info_fields = [
 LossInfo = namedarraytuple("LossInfo", loss_info_fields)
 OptInfo = namedarraytuple(
     "OptInfo",
-    ["loss", "grad_norm_model", "grad_norm_actor", "grad_norm_value"]
+    ["loss", "grad_norm_model", "grad_norm_actor", "grad_norm_value", "grad_norm_adv"]
     + loss_info_fields,
 )
 
@@ -186,9 +186,9 @@ class Nightmare(RlAlgorithm):
             self.value_optimizer.zero_grad()
             self.model_adversarial_optimizer.zero_grad()
 
-            model_loss.backward()
-            actor_loss.backward()
-            value_loss.backward()
+            model_loss.backward(retain_graph=True)
+            actor_loss.backward(retain_graph=True)
+            value_loss.backward(retain_graph=True)
             adv_loss.backward()
 
             grad_norm_model = torch.nn.utils.clip_grad_norm_(
@@ -308,7 +308,7 @@ class Nightmare(RlAlgorithm):
         # Rollout model by taking the same series of actions as the real model
         # but we only end up using the initiatlization as the previous state's posterior
         # since all the obesevations are corrpted with adversarial noise
-        prior, post = model.rollout.dversarial_rollout_representation(
+        prior, post = model.rollout.adversarial_rollout_representation(
             batch_t, embed, action, prev_state
         )
 
