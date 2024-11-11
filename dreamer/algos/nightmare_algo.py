@@ -34,7 +34,7 @@ OptInfo = namedarraytuple(
 )
 
 
-class Dreamer(RlAlgorithm):
+class Nightmare(RlAlgorithm):
     def __init__(
         self,  # Hyper-parameters
         batch_size=50,
@@ -73,6 +73,7 @@ class Dreamer(RlAlgorithm):
         video_summary_b=4,
         use_pcont=False,
         pcont_scale=10.0,
+        adv_beta=0.1,
     ):
         super().__init__()
         if optim_kwargs is None:
@@ -81,7 +82,7 @@ class Dreamer(RlAlgorithm):
         del batch_size  # Property.
         save__init__args(locals())
         self.update_counter = 0
-
+        self.adv_embed = adv_beta
         self.optimizer = None
         self.type = type
 
@@ -117,12 +118,18 @@ class Dreamer(RlAlgorithm):
             model.representation,
             model.transition,
         ]
+        self.model_modules_adversarial = [
+            model.observation_encoder.adversarial_encoder,
+        ]
         if self.use_pcont:
             self.model_modules += [model.pcont]
         self.actor_modules = [model.action_decoder]
         self.value_modules = [model.value_model]
         self.model_optimizer = torch.optim.Adam(
-            get_parameters(self.model_modules), lr=self.model_lr, **self.optim_kwargs
+            get_parameters(self.model_modules_adversarial), lr=self.model_lr, **self.optim_kwargs
+        )
+        self.model_adversarial_optimizer = torch.optim.Adam(
+            get_parameters(model.observation_encoder.adversarial_encoder), lr=self.model_lr, **self.optim_kwargs
         )
         self.actor_optimizer = torch.optim.Adam(
             get_parameters(self.actor_modules), lr=self.actor_lr, **self.optim_kwargs
@@ -143,6 +150,7 @@ class Dreamer(RlAlgorithm):
             model_optimizer_dict=self.model_optimizer.state_dict(),
             actor_optimizer_dict=self.actor_optimizer.state_dict(),
             value_optimizer_dict=self.value_optimizer.state_dict(),
+            model_adversarial_optimizer_dict=self.model_adversarial_optimizer.state_dict(),
         )
 
     def load_optim_state_dict(self, state_dict):
@@ -151,6 +159,7 @@ class Dreamer(RlAlgorithm):
         self.model_optimizer.load_state_dict(state_dict["model_optimizer_dict"])
         self.actor_optimizer.load_state_dict(state_dict["actor_optimizer_dict"])
         self.value_optimizer.load_state_dict(state_dict["value_optimizer_dict"])
+        self.model_adversarial_optimizer.load_state_dict(state_dict["model_adversarial_optimizer_dict"])
 
     def optimize_agent(self, itr, samples=None, sampler_itr=None):
         itr = itr if sampler_itr is None else sampler_itr
@@ -168,17 +177,19 @@ class Dreamer(RlAlgorithm):
                 self._batch_size, self.batch_length
             )
             buffed_samples = buffer_to(samples_from_replay, self.agent.device)
-            model_loss, actor_loss, value_loss, loss_info = self.loss(
+            model_loss, actor_loss, value_loss, adv_loss, loss_info = self.loss(
                 buffed_samples, itr, i
             )
 
             self.model_optimizer.zero_grad()
             self.actor_optimizer.zero_grad()
             self.value_optimizer.zero_grad()
+            self.model_adversarial_optimizer.zero_grad()
 
             model_loss.backward()
             actor_loss.backward()
             value_loss.backward()
+            adv_loss.backward()
 
             grad_norm_model = torch.nn.utils.clip_grad_norm_(
                 get_parameters(self.model_modules), self.grad_clip
@@ -189,22 +200,28 @@ class Dreamer(RlAlgorithm):
             grad_norm_value = torch.nn.utils.clip_grad_norm_(
                 get_parameters(self.value_modules), self.grad_clip
             )
+            grad_norm_adv = torch.nn.utils.clip_grad_norm_(
+                get_parameters(self.model_modules_adversarial),self.grad_clip
+            )
 
             self.model_optimizer.step()
             self.actor_optimizer.step()
             self.value_optimizer.step()
+            self.model_adversarial_optimizer.step()
 
             with torch.no_grad():
-                loss = model_loss + actor_loss + value_loss
+                loss = model_loss + actor_loss + value_loss + adv_loss
             opt_info.loss.append(loss.item())
             if isinstance(grad_norm_model, torch.Tensor):
                 opt_info.grad_norm_model.append(grad_norm_model.item())
                 opt_info.grad_norm_actor.append(grad_norm_actor.item())
                 opt_info.grad_norm_value.append(grad_norm_value.item())
+                opt_info.grad_norm_adv.append(grad_norm_adv.item())
             else:
                 opt_info.grad_norm_model.append(grad_norm_model)
                 opt_info.grad_norm_actor.append(grad_norm_actor)
                 opt_info.grad_norm_value.append(grad_norm_value)
+                opt_info.grad_norm_adv.append(grad_norm_adv)
             for field in loss_info_fields:
                 if hasattr(opt_info, field):
                     getattr(opt_info, field).append(getattr(loss_info, field).item())
@@ -243,7 +260,8 @@ class Dreamer(RlAlgorithm):
         # normalize image
         observation = observation.type(self.type) / 255.0 - 0.5
         # embed the image
-        embed = model.observation_encoder(observation)
+        # embedd and adv_embed dim is [batch_t, batch_b, embed_size]
+        embed, adv_embed = model.observation_encoder(observation)
 
         prev_state = model.representation.initial_state(
             batch_b, device=action.device, dtype=action.dtype
@@ -281,6 +299,19 @@ class Dreamer(RlAlgorithm):
         # Actor Loss
 
         # remove gradients from previously calculated tensors
+
+        embed= model.observation_encoder(observation, adv_embed=True, beta=self.adv_beta)
+
+        prev_state = model.representation.initial_state(
+            batch_b, device=action.device, dtype=action.dtype
+        )
+        # Rollout model by taking the same series of actions as the real model
+        # but we only end up using the initiatlization as the previous state's posterior
+        # since all the obesevations are corrpted with adversarial noise
+        prior, post = model.rollout.dversarial_rollout_representation(
+            batch_t, embed, action, prev_state
+        )
+
         with torch.no_grad():
             if self.use_pcont:
                 # "Last step could be terminal." Done in TF2 code, but unclear why
@@ -291,6 +322,8 @@ class Dreamer(RlAlgorithm):
                 flat_post = buffer_method(post, "reshape", batch_size, -1)
         # Rollout the policy for self.horizon steps. Variable names with imag_ indicate this data is imagined not real.
         # imag_feat shape is [horizon, batch_t * batch_b, feature_size]
+        # this is the imagination/dreaming of the nightmare part of the algorithm
+        
         with FreezeParameters(self.model_modules):
             imag_dist, _ = model.rollout.rollout_policy(
                 self.horizon, model.policy, flat_post
@@ -336,6 +369,9 @@ class Dreamer(RlAlgorithm):
         value_pred = model.value_model(value_feat)
         log_prob = value_pred.log_prob(value_target)
         value_loss = -torch.mean(value_discount * log_prob.unsqueeze(2))
+        # adversarial loss is the average value predicted by the value model 
+        # for the imagined states
+        adv_loss = torch.mean(value_pred.mean)
 
         # ------------------------------------------  Gradient Barrier  ------------------------------------------------
         # loss info
@@ -369,7 +405,7 @@ class Dreamer(RlAlgorithm):
                         t=self.video_summary_t,
                     )
 
-        return model_loss, actor_loss, value_loss, loss_info
+        return model_loss, actor_loss, value_loss, adv_loss, loss_info
 
     def write_videos(self, observation, action, image_pred, post, step=None, n=4, t=25):
         """

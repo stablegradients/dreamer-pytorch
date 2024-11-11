@@ -203,6 +203,36 @@ class RSSMRollout(RollOutModule):
         prior = stack_states(priors, dim=0)
         post = stack_states(posteriors, dim=0)
         return prior, post
+    
+    def adversarial_rollout_representation(
+        self,
+        steps: int,
+        obs_embed: torch.Tensor,
+        action: torch.Tensor,
+        prev_state: RSSMState,
+    ):
+        """
+        Roll out the model with actions and observations from data. but the 
+        posterior of the prev state is not used since we are adversarially corrupting the 
+        observation. These single step corrupted observation act as a starting point for the 
+        next steps during the imagination phase
+        :param steps: number of steps to roll out
+        :param obs_embed: size(time_steps, batch_size, embedding_size)
+        :param action: size(time_steps, batch_size, action_size)
+        :param prev_state: RSSM state, size(batch_size, state_size)
+        :return: prior, posterior states. size(time_steps, batch_size, state_size)
+        """
+        priors = []
+        posteriors = []
+        for t in range(steps):
+            prior_state, posterior_state = self.representation_model(
+                obs_embed[t], action[t], prev_state
+            )
+            priors.append(prior_state)
+            posteriors.append(posterior_state)
+        prior = stack_states(priors, dim=0)
+        post = stack_states(posteriors, dim=0)
+        return prior, post
 
     def rollout_transition(
         self, steps: int, action: torch.Tensor, prev_state: RSSMState

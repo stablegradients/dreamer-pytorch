@@ -4,29 +4,82 @@ import torch.distributions as td
 import torch.nn as nn
 
 
-class ObservationEncoder(nn.Module):
+import torch
+import torch.nn as nn
+
+# Backbone class for shared feature extraction layers
+class Backbone(nn.Module):
     def __init__(self, depth=32, stride=2, shape=(3, 64, 64), activation=nn.ReLU):
         super().__init__()
-        self.convolutions = nn.Sequential(
+        self.layers = nn.Sequential(
             nn.Conv2d(shape[0], 1 * depth, 4, stride),
             activation(),
             nn.Conv2d(1 * depth, 2 * depth, 4, stride),
             activation(),
+        )
+
+    def forward(self, obs):
+        return self.layers(obs)
+
+# Encoder class for main feature extraction
+class Encoder(nn.Module):
+    def __init__(self, backbone, depth=32, stride=2, activation=nn.ReLU):
+        super().__init__()
+        self.backbone = backbone
+        self.convolutions = nn.Sequential(
             nn.Conv2d(2 * depth, 4 * depth, 4, stride),
             activation(),
             nn.Conv2d(4 * depth, 8 * depth, 4, stride),
             activation(),
         )
-        self.shape = shape
-        self.stride = stride
-        self.depth = depth
 
     def forward(self, obs):
+        backbone_embed = self.backbone(obs)
+        conv_embed = self.convolutions(backbone_embed)
+        return conv_embed
+
+# AdversarialEncoder class for adversarial feature extraction
+class AdversarialEncoder(nn.Module):
+    def __init__(self, backbone, depth=32, stride=2, activation=nn.ReLU):
+        super().__init__()
+        self.backbone = backbone
+        self.adversarial_convolutions = nn.Sequential(
+            nn.Conv2d(2 * depth, 4 * depth, 4, stride),
+            activation(),
+            nn.Conv2d(4 * depth, 8 * depth, 4, stride),
+        )
+
+    def forward(self, obs):
+        backbone_embed = self.backbone(obs)
+        adversarial_conv_embed = self.adversarial_convolutions(backbone_embed)
+        return nn.Tanh(adversarial_conv_embed)
+
+# Combined class to use both encoders
+class ObservationEncoder(nn.Module):
+    def __init__(self, depth=32, stride=2, shape=(3, 64, 64), activation=nn.ReLU):
+        super().__init__()
+        self.backbone = Backbone(depth, stride, shape, activation)
+        self.encoder = Encoder(self.backbone, depth, stride, activation)
+        self.adversarial_encoder = AdversarialEncoder(self.backbone, depth, stride, activation)
+
+    def forward(self, obs, adv=False, beta=0.1):
         batch_shape = obs.shape[:-3]
         img_shape = obs.shape[-3:]
-        embed = self.convolutions(obs.reshape(-1, *img_shape))
-        embed = torch.reshape(embed, (*batch_shape, -1))
-        return embed
+
+        # Reshape input for batch processing
+        obs = obs.reshape(-1, *img_shape)
+
+        # Get embeddings from both encoders
+        conv_embed = self.encoder(obs)
+        adversarial_conv_embed = self.adversarial_encoder(obs)
+
+        # Reshape back to original batch shape
+        conv_embed = torch.reshape(conv_embed, (*batch_shape, -1))
+        adversarial_conv_embed = torch.reshape(adversarial_conv_embed, (*batch_shape, -1))
+        if adv:
+            return conv_embed + beta * adversarial_conv_embed
+        else:
+            return conv_embed
 
     @property
     def embed_size(self):
