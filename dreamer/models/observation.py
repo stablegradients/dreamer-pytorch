@@ -48,11 +48,12 @@ class AdversarialEncoder(nn.Module):
             activation(),
             nn.Conv2d(4 * depth, 8 * depth, 4, stride),
         )
+        self.tanh = nn.Tanh()  # Instantiate Tanh once
 
     def forward(self, obs):
         backbone_embed = self.backbone(obs)
         adversarial_conv_embed = self.adversarial_convolutions(backbone_embed)
-        return nn.Tanh(adversarial_conv_embed)
+        return self.tanh(adversarial_conv_embed)  # Apply Tanh
 
 # Combined class to use both encoders
 class ObservationEncoder(nn.Module):
@@ -61,6 +62,9 @@ class ObservationEncoder(nn.Module):
         self.backbone = Backbone(depth, stride, shape, activation)
         self.encoder = Encoder(self.backbone, depth, stride, activation)
         self.adversarial_encoder = AdversarialEncoder(self.backbone, depth, stride, activation)
+        self.shape = shape
+        self.stride = stride
+        self.depth = depth
 
     def forward(self, obs, adv=False, beta=0.1):
         batch_shape = obs.shape[:-3]

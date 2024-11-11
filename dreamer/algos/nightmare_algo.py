@@ -126,10 +126,10 @@ class Nightmare(RlAlgorithm):
         self.actor_modules = [model.action_decoder]
         self.value_modules = [model.value_model]
         self.model_optimizer = torch.optim.Adam(
-            get_parameters(self.model_modules_adversarial), lr=self.model_lr, **self.optim_kwargs
+            get_parameters(self.model_modules), lr=self.model_lr, **self.optim_kwargs
         )
         self.model_adversarial_optimizer = torch.optim.Adam(
-            get_parameters(model.observation_encoder.adversarial_encoder), lr=self.model_lr, **self.optim_kwargs
+            get_parameters(self.model_modules_adversarial), lr=self.model_lr, **self.optim_kwargs
         )
         self.actor_optimizer = torch.optim.Adam(
             get_parameters(self.actor_modules), lr=self.actor_lr, **self.optim_kwargs
