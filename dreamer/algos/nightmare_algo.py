@@ -261,7 +261,7 @@ class Nightmare(RlAlgorithm):
         observation = observation.type(self.type) / 255.0 - 0.5
         # embed the image
         # embedd and adv_embed dim is [batch_t, batch_b, embed_size]
-        embed, adv_embed = model.observation_encoder(observation)
+        embed = model.observation_encoder(observation)
 
         prev_state = model.representation.initial_state(
             batch_b, device=action.device, dtype=action.dtype
@@ -300,7 +300,7 @@ class Nightmare(RlAlgorithm):
 
         # remove gradients from previously calculated tensors
 
-        embed= model.observation_encoder(observation, adv_embed=True, beta=self.adv_beta)
+        embed= model.observation_encoder(observation, adv=True, beta=self.adv_beta)
 
         prev_state = model.representation.initial_state(
             batch_b, device=action.device, dtype=action.dtype
