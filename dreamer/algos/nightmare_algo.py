@@ -73,7 +73,7 @@ class Nightmare(RlAlgorithm):
         video_summary_b=4,
         use_pcont=False,
         pcont_scale=10.0,
-        adv_beta=0.1,
+        adv_beta=0.05,
     ):
         super().__init__()
         if optim_kwargs is None:
@@ -82,7 +82,8 @@ class Nightmare(RlAlgorithm):
         del batch_size  # Property.
         save__init__args(locals())
         self.update_counter = 0
-        self.adv_embed = adv_beta
+        self.adv_beta = None
+        self.adv_beta_max = adv_beta
         self.optimizer = None
         self.type = type
 
@@ -172,12 +173,16 @@ class Nightmare(RlAlgorithm):
             return opt_info
         if itr % self.train_every != 0:
             return opt_info
+        
+        # a schedule for beta
+        self.adv_beta = self.adv_beta_max
+
         for i in tqdm(range(self.train_steps), desc="Imagination"):
             samples_from_replay = self.replay_buffer.sample_batch(
                 self._batch_size, self.batch_length
             )
             buffed_samples = buffer_to(samples_from_replay, self.agent.device)
-            model_loss, actor_loss, value_loss, adv_loss, loss_info = self.loss(
+            model_loss, actor_loss, value_loss, loss_info = self.loss(
                 buffed_samples, itr, i
             )
 
@@ -186,10 +191,10 @@ class Nightmare(RlAlgorithm):
             self.value_optimizer.zero_grad()
             self.model_adversarial_optimizer.zero_grad()
 
-            model_loss.backward(retain_graph=True)
-            actor_loss.backward(retain_graph=True)
-            value_loss.backward(retain_graph=True)
-            adv_loss.backward()
+            model_loss.backward()
+            actor_loss.backward()
+            value_loss.backward()
+            
 
             grad_norm_model = torch.nn.utils.clip_grad_norm_(
                 get_parameters(self.model_modules), self.grad_clip
@@ -200,13 +205,23 @@ class Nightmare(RlAlgorithm):
             grad_norm_value = torch.nn.utils.clip_grad_norm_(
                 get_parameters(self.value_modules), self.grad_clip
             )
-            grad_norm_adv = torch.nn.utils.clip_grad_norm_(
-                get_parameters(self.model_modules_adversarial),self.grad_clip
-            )
+            
 
             self.model_optimizer.step()
             self.actor_optimizer.step()
             self.value_optimizer.step()
+            
+            
+            self.model_optimizer.zero_grad()
+            self.actor_optimizer.zero_grad()
+            self.value_optimizer.zero_grad()
+            self.model_adversarial_optimizer.zero_grad()
+
+            adv_loss = self.adversarial_loss(buffed_samples, itr, i)
+            adv_loss.backward()
+            grad_norm_adv = torch.nn.utils.clip_grad_norm_(
+                get_parameters(self.model_modules_adversarial),self.grad_clip
+            )
             self.model_adversarial_optimizer.step()
 
             with torch.no_grad():
@@ -227,6 +242,7 @@ class Nightmare(RlAlgorithm):
                     getattr(opt_info, field).append(getattr(loss_info, field).item())
 
         return opt_info
+    
 
     def loss(self, samples: SamplesFromReplay, sample_itr: int, opt_itr: int):
         """
@@ -239,7 +255,6 @@ class Nightmare(RlAlgorithm):
         :return: FloatTensor containing the loss
         """
         model = self.agent.model
-
         observation = samples.all_observation[
             :-1
         ]  # [t, t+batch_length+1] -> [t, t+batch_length]
@@ -260,7 +275,6 @@ class Nightmare(RlAlgorithm):
         # normalize image
         observation = observation.type(self.type) / 255.0 - 0.5
         # embed the image
-        # embedd and adv_embed dim is [batch_t, batch_b, embed_size]
         embed = model.observation_encoder(observation)
 
         prev_state = model.representation.initial_state(
@@ -299,19 +313,14 @@ class Nightmare(RlAlgorithm):
         # Actor Loss
 
         # remove gradients from previously calculated tensors
-
-        embed= model.observation_encoder(observation, adv=True, beta=self.adv_beta)
+        embed = model.observation_encoder(observation, adv=True, beta=self.adv_beta)
 
         prev_state = model.representation.initial_state(
             batch_b, device=action.device, dtype=action.dtype
         )
-        # Rollout model by taking the same series of actions as the real model
-        # but we only end up using the initiatlization as the previous state's posterior
-        # since all the obesevations are corrpted with adversarial noise
         prior, post = model.rollout.adversarial_rollout_representation(
             batch_t, embed, action, prev_state
         )
-
         with torch.no_grad():
             if self.use_pcont:
                 # "Last step could be terminal." Done in TF2 code, but unclear why
@@ -322,8 +331,6 @@ class Nightmare(RlAlgorithm):
                 flat_post = buffer_method(post, "reshape", batch_size, -1)
         # Rollout the policy for self.horizon steps. Variable names with imag_ indicate this data is imagined not real.
         # imag_feat shape is [horizon, batch_t * batch_b, feature_size]
-        # this is the imagination/dreaming of the nightmare part of the algorithm
-        
         with FreezeParameters(self.model_modules):
             imag_dist, _ = model.rollout.rollout_policy(
                 self.horizon, model.policy, flat_post
@@ -369,9 +376,6 @@ class Nightmare(RlAlgorithm):
         value_pred = model.value_model(value_feat)
         log_prob = value_pred.log_prob(value_target)
         value_loss = -torch.mean(value_discount * log_prob.unsqueeze(2))
-        # adversarial loss is the average value predicted by the value model 
-        # for the imagined states
-        adv_loss = torch.mean(value_pred.mean)
 
         # ------------------------------------------  Gradient Barrier  ------------------------------------------------
         # loss info
@@ -405,7 +409,60 @@ class Nightmare(RlAlgorithm):
                         t=self.video_summary_t,
                     )
 
-        return model_loss, actor_loss, value_loss, adv_loss, loss_info
+        return model_loss, actor_loss, value_loss, loss_info
+
+    def adversarial_loss(self, samples: SamplesFromReplay, sample_itr: int, opt_itr: int):
+        model = self.agent.model
+        for param in model.observation_encoder.adversarial_encoder.parameters():
+            param.requires_grad = True
+        
+        observation = samples.all_observation[:-1]
+        action = samples.all_action[1:]
+        reward = samples.all_reward[1:].unsqueeze(2)
+        done = samples.done.unsqueeze(2)
+
+        lead_dim, batch_t, batch_b, img_shape = infer_leading_dims(observation, 3)
+        batch_size = batch_t * batch_b
+
+        observation = observation.type(self.type) / 255.0 - 0.5
+        embed = model.observation_encoder(observation, adv=True, beta=self.adv_beta)
+
+        prev_state = model.representation.initial_state(
+            batch_b, device=action.device, dtype=action.dtype
+        )
+        prior, post = model.rollout.adversarial_rollout_representation(
+            batch_t, embed, action, prev_state
+        )
+
+        flat_post = buffer_method(post, "reshape", batch_size, -1)
+
+        imag_dist, _ = model.rollout.rollout_policy(
+            self.horizon, model.policy, flat_post
+        )
+        imag_feat = get_feat(imag_dist)
+        imag_reward = model.reward_model(imag_feat).mean
+        value = model.value_model(imag_feat).mean
+
+        if self.use_pcont:
+            discount_arr = model.pcont(imag_feat).mean
+        else:
+            discount_arr = self.discount * torch.ones_like(imag_reward)
+
+        returns = self.compute_return(
+            imag_reward[:-1],
+            value[:-1],
+            discount_arr[:-1],
+            bootstrap=value[-1],
+            lambda_=self.discount_lambda,
+        )
+
+        discount_arr = torch.cat([torch.ones_like(discount_arr[:1]), discount_arr[1:]])
+        discount = torch.cumprod(discount_arr[:-1], 0)
+        
+        # Ensure adv_loss has requires_grad enabled
+        adv_loss = torch.mean(discount * returns)
+        return adv_loss
+
 
     def write_videos(self, observation, action, image_pred, post, step=None, n=4, t=25):
         """

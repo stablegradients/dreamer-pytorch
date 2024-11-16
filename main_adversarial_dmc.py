@@ -26,6 +26,7 @@ def build_and_train(
     eval=False,
     save_model="last",
     load_model_path=None,
+    adv_beta=None,
 ):
     params = torch.load(load_model_path) if load_model_path else {}
     agent_state_dict = params.get("agent_state_dict")
@@ -49,7 +50,7 @@ def build_and_train(
         eval_max_steps=int(10e3),
         eval_max_trajectories=5,
     )
-    algo = Nightmare(initial_optim_state_dict=optimizer_state_dict)  # Run with defaults.
+    algo = Nightmare(initial_optim_state_dict=optimizer_state_dict, adv_beta=adv_beta)  # Run with defaults.
     agent = DMCDreamerAgent(
         train_noise=0.3,
         eval_noise=0,
@@ -108,6 +109,8 @@ if __name__ == "__main__":
         datetime.datetime.now().strftime("%Y%m%d"),
     )
     parser.add_argument("--log-dir", type=str, default=default_log_dir)
+    # argument for adv_beta
+    parser.add_argument("--adv_beta", type=float)
     args = parser.parse_args()
     log_dir = os.path.abspath(args.log_dir)
     i = args.run_ID
@@ -124,4 +127,5 @@ if __name__ == "__main__":
         eval=args.eval,
         save_model=args.save_model,
         load_model_path=args.load_model_path,
+        adv_beta=args.adv_beta,
     )
